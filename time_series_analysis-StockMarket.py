@@ -1,0 +1,272 @@
+#%%
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+import cpi
+from statsmodels.tsa.stattools import adfuller, acf, pacf
+from statsmodels.graphics.tsaplots import plot_acf, plot_pacf
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import pmdarima as pm
+from sklearn.metrics import mean_squared_error
+from math import sqrt
+import scipy
+import statsmodels
+from datetime import date
+from methods import adf_test
+
+#%%
+# --------------------------- Select Data via API ---------------------------
+msft = yf.Ticker("MSFT")
+# display stock info
+msft.info
+
+
+#%%
+# download the dow jones and microsoft data together
+data = yf.download(["MSFT", "^DJI"], start="2010-01-01",
+                    end="2024-01-01")
+data
+
+# %%
+# --------------------------- Preview Data Graphically ---------------------------
+data.Close.MSFT.plot(title="MSFT");
+
+#%%
+data.Close['^DJI'].plot(title="^DJI")
+# %%
+# --------------------------- Adjust Data for Inflation ---------------------------
+cpi.update()
+close = data.Close.copy()
+close.rename(columns={"^DJI" : "DJI"}, inplace=True)
+close
+#%%
+#isolation of the unique months in the data
+date_range = pd.date_range(close.index[0] - pd.DateOffset(days=3),
+                           close.index[-1], freq="MS")
+date_range
+# %%
+cpi_mon = pd.DataFrame(index=date_range)
+cpi_mon.info()
+# %%
+cpi_202301 = cpi.get(date(2023,1,1))
+cpi_202301
+# %%
+cpi_mon['factor'] = cpi_mon.index.map(lambda x: cpi_202301 / cpi.get(x.date()))
+cpi_mon
+# %%
+close['factor'] = close.index.to_period('M').map(cpi_mon.factor.to_period('M').to_dict())
+close
+
+#%% 
+#inflate set of time series
+cols = ["MSFT", "DJI"]
+for col in cols:
+    close[f'{col}_scaled'] = close[col] * close.factor
+close
+#%%
+# sclaed data inspection
+close.MSFT_scaled.plot()
+
+#%% in its logarithmic form
+np.log(close.MSFT_scaled).plot()
+
+#%%
+close.DJI_scaled.plot()
+#%%
+# --------------------------- Data Pre-Processing ---------------------------
+# resampling data to a mothly frequency to reduce noise and computational load
+# create a train-test split - train with data up to 2023, and test on the remaining data.
+close.info()
+
+split_date = '2023-01-01'
+
+train_data = close[:split_date]
+
+test_data = close[split_date:]
+
+print(f'Training data length: {len(train_data)}')
+print(f'Testing Data Length: {len(test_data)}')
+
+#%%
+# --------------------------- Test for Stationarity ---------------------------
+# Use ADF tests and explore autocorrelation
+adf_test(train_data['MSFT'], 'Adjusted Stock Price')
+adf_test(train_data['DJI'], 'Adjusted Index Price')
+
+#%%
+# ADF test on logged stock data
+adf_test(np.log(train_data['MSFT']), 'Adjusted Stock Price')
+adf_test(np.log(train_data['DJI']), "Adjusted Index Price")
+
+#%%
+# perform ADF test on logged & differenced stock data
+adf_test(np.log(train_data['MSFT']).diff(), "Adjusted Stock Price")
+adf_test(np.log(train_data['DJI']).diff(), "Adjusted Index Price")
+
+#%%
+# perform ADF test on logged returns of stock data
+#   Returns are the ratio of adjacent observations
+
+adf_test(np.log(train_data['MSFT'] / train_data['MSFT'].shift(1)), 'Adjusted Stock Price')
+adf_test(np.log(train_data['DJI'] / train_data['DJI'].shift(1)), 'Adjusted Stock Price')
+
+#%% 
+# Plot ACF and PACF
+fig, axes = plt.subplots(1, 2, figsize=(16,4))
+a = plot_acf(train_data['MSFT'].dropna(), lags=60, ax=axes[0])
+b = plot_pacf(train_data['MSFT'].dropna(), lags=60, ax=axes[1])
+
+#%%
+fig, axes = plt.subplots(1,2,figsize=(16,4))
+a = plot_acf(train_data['DJI'].dropna(), lags=60, ax=axes[0])
+b = plot_pacf(train_data['DJI'].dropna(), lags=60, ax=axes[1])
+
+#%%
+fig, axes = plt.subplots(1,2, figsize=(16,4))
+a = plot_acf(np.log(train_data['MSFT'] / train_data['MSFT'].shift(1)).dropna(), lags=60, ax=axes[0])
+b = plot_pacf(np.log(train_data['MSFT'] / train_data['MSFT'].shift(1)).dropna(), lags=60, ax=axes[1])
+
+#%%
+fig, axes = plt.subplots(1,2, figsize=(16,4))
+a = plot_acf(np.log(train_data['DJI'] / train_data['DJI'].shift(1)).dropna(), lags=60, ax=axes[0])
+b = plot_pacf(np.log(train_data['DJI'] / train_data['DJI'].shift(1)).dropna(), lags=60, ax=axes[1])
+
+#%%
+# --------------------------- Determine SARIMAX Params ---------------------------
+# prepare exogenous variables 
+exog_train = train_data['DJI_scaled']
+exog_test = test_data['DJI_scaled']
+
+auto_model = pm.auto_arima(np.log(train_data['MSFT_scaled']), exogenous=exog_train, seasonal=True,
+                           m=5, trace=True, error_action='ignore', suppress_warnings=True)
+print(auto_model.summary())
+
+"""
+The AIC is a measure of model quality, balancing model fit (log-likelihood) against model complexity 
+(number of parameters). 
+
+Lower AIC values indicate better models, assuming the difference is significant.
+
+Rule of Thumb for AIC, as interpreted from **Differences from between one another** (e.g., comparing two version)
+∣ΔAIC∣<2: Models are statistically indistinguishable in terms of fit.
+         Differences this small may not justify choosing one model over another purely based on AIC.
+∣ΔAIC∣>2: A model with a lower AIC is considered significantly better.
+∣ΔAIC∣>10: Strong evidence that the model with the lower AIC is much better.
+
+"""
+
+#%%
+# --------------------------- Fit the SARIMAX Model ---------------------------
+# extract theg best params
+order = auto_model.order
+seasonal_order = auto_model.seasonal_order
+
+# fit the SARIMAX model
+sarimax_model = SARIMAX(np.log(train_data['MSFT_scaled']),
+                        exog=exog_train,
+                        order=order,
+                        seasonal_order=seasonal_order,
+                        trend='ct') # Adding the constant (intercept) and trend consideration helps performance
+sarimax_results = sarimax_model.fit(method='powell') # changing the solver method from the default aids convergence
+print(sarimax_results.summary())
+#%%
+# --------------------------- Forecast Future Stock Prices ---------------------------
+n_periods = len(test_data)
+forecast = sarimax_results.get_forecast(steps=n_periods, exog=exog_test)
+forecast_mean = np.exp(forecast.predicted_mean)/test_data.factor.values
+confidence_intervals = forecast.conf_int()
+lower_limits = np.exp(confidence_intervals.loc[:, 'lower MSFT_scaled'])/test_data.factor.values
+upper_limits = np.exp(confidence_intervals.loc[:, 'upper MSFT_scaled'])/test_data.factor.values
+
+#store results
+forecast_dates = test_data.index
+forecast_df = pd.DataFrame({
+    'Forecast': forecast_mean.values,
+    'Lower CI': lower_limits.values,
+    'Upper CI': upper_limits.values,
+    'Actual': test_data['MSFT'].values 
+}, index=forecast_dates)
+
+# plotting
+
+plt.figure(figsize=(14,6))
+plt.plot(train_data.index, train_data['MSFT'], label='Training Data')
+plt.plot(test_data.index, test_data['MSFT'], label='Actual Stock Price')
+plt.plot(train_data.index, np.exp(sarimax_results.fittedvalues)/train_data.factor, ':',
+         label='Prior Forecast')
+plt.plot(forecast_df.index, forecast_df['Forecast'], label='Forecast', color='red')
+plt.fill_between(forecast_df.index, forecast_df['Lower CI'], forecast_df['Upper CI'],
+         color='pink', alpha=0.3, label='95% Confidence Interval')
+plt.title('SARIMAX Forecast of MSFT Price')
+plt.xlabel('Date')
+plt.ylabel('Price')
+plt.legend();
+#%%
+# Examine the forecast period
+forecast_df['Upper CI'].plot(color='wheat', title='Forecast Period')
+plt.fill_between(
+    forecast_df.index,
+    forecast_df['Lower CI'],
+    forecast_df['Upper CI'],
+    alpha = 0.3,
+    color='wheat',
+    label='95% Confidence Interval'
+)
+forecast_df['Lower CI'].plot(color='wheat')
+forecast_df.Actual.plot(label='Actual')
+forecast_df.Forecast.plot()
+plt.legend()
+plt.ylabel('Price');
+# %%
+# statistics
+rmse = sqrt(mean_squared_error(test_data['MSFT'], forecast_df['Forecast']))
+print(f'RMSE: {rmse}')
+
+#%%
+# inspect values
+forecast_df['Diff'] = forecast_df.Forecast - forecast_df.Actual
+forecast_df
+forecast_df['Diff'].plot(title='Forecast Difference from Actual')
+plt.axhline(y=0, color='r')
+plt.ylabel('Price');
+
+#%%
+jan_2023 = test_data.loc['2023-01-31']
+jan_forecast = forecast_df.loc['2023-01-31']
+
+print(f'Actual Price (January 2023): {jan_2023['MSFT']}')
+print(f'Forecasted Price (January 2023): {jan_forecast['Forecast']}')
+
+#%%
+# inspect the residuals
+resids = sarimax_results.resid[1:]
+plt.figure(figsize=(14, 6))
+plt.plot(resids)
+plt.title('Residuals of the SARIMAX Model')
+plt.xlabel('Date')
+plt.ylabel('Residual');
+
+#%%
+# plot acf residuals
+plot_acf(resids.dropna(), lags=40)
+plt.show()
+
+#%%
+sarimax_results.plot_diagnostics()
+plt.tight_layout()
+
+"""
+This model rather dramatically misses the extremes.
+
+It predicts the mean reasonably well, but the model is not
+going to capture large moves in this stock.
+
+At the same time, because the errors are not behaving normally,
+any uncertainty estimates are likely to be unreliable.
+
+We would be interested to determine whether the large residual 
+spikes correspond to known events in the time series.
+"""
+# %%
